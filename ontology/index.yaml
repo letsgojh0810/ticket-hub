@@ -41,5 +41,16 @@ domains:
       - redis
       - kafka
 
+  - id: ticket-reservation
+    path: 티켓예매/예약-결제
+    file: abox/ticket-reservation.yaml
+    summary: 대규모 동시성 제어 기반 티켓 좌석 예약·결제 도메인. Redisson 분산 락 + Redis 대기열 + Kafka 이벤트로 구성.
+    repos:
+      - ticket-lab-be
+    infra:
+      - mysql
+      - redis
+      - kafka
+
 cross_domain: abox/cross-domain.yaml
 shared_infra: abox/infra.yaml

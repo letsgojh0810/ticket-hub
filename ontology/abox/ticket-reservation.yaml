@@ -1,0 +1,208 @@
+# ticket-reservation 도메인
+# 대규모 동시성 환경에서 티켓 좌석 예약·결제를 처리하는 도메인.
+# Redisson 분산 락 + Redis 대기열 + Kafka 비동기 이벤트 + SSE 실시간 알림 조합.
+
+domain:
+  id: ticket-reservation
+  name: 티켓 예매
+  summary: |
+    수만 명 동시 접속 환경에서 좌석 중복 판매를 방지하고 DB 과부하를 방어하는
+    티켓 예매 시스템. Redis ZSet 대기열로 입장을 제어하고, Redisson 분산 락으로
+    좌석 선점 충돌을 방지하며, DB를 상태 원천으로 삼아 Redis 캐시와 이중 확인한다.
+    예약 완료/실패 이벤트는 Kafka로 발행하고, SSE로 전체 클라이언트에 실시간 브로드캐스트한다.
+    1000명 동시 / 100좌석 부하 테스트 완료.
+  notes: |
+    - 포트폴리오/실습 프로젝트. Spring Boot 3 + Java 17 + Gradle.
+    - 외부 PG 시뮬레이터(`:8082`)와 WebClient 동기 호출로 연동.
+    - CORS: `http://localhost:5173` (Vite 프런트엔드 개발 서버) 전용.
+    - SMTP 이메일 발송은 코드·의존성 모두 주석 처리(비활성화), Kafka Consumer 로그로 대체.
+
+entities:
+  # ── processes ────────────────────────────────────────────────
+  - id: waiting-queue
+    name: 대기열 관리
+    type: process
+    summary: |
+      Redis ZSet(`ticket:waiting:queue`)으로 진입 타임스탬프 순 대기열을 관리한다.
+      QueueScheduler가 1초마다 실행되어 Active User 한도(200명)까지 개별 TTL 키
+      (`ticket:active:users:{userId}`, 5분)로 전환한다.
+      ReservationFacade가 좌석 선점 전 isAllowed() 로 Active User 여부를 검증한다.
+    repo: ticket-lab-be
+    package: src/main/java/com/example/ticket/infrastructure/redis
+
+  - id: seat-reservation
+    name: 좌석 선점 프로세스
+    type: process
+    summary: |
+      ReservationFacade.reserve()가 오케스트레이션한다.
+      1) Active User 검증 → 2) Redisson RLock 획득(1초 대기/2초 점유) →
+      3) DB 재확인(DB가 원천) → 4) Reservation(HELD) + Seat(SELECTED) 저장 →
+      5) Redis 캐시 갱신(TTL 5분, 실패 시 무시) → 6) Redis Pub/Sub 브로드캐스트 →
+      7) SSE 전파. finally에서 락 해제.
+    repo: ticket-lab-be
+    package: src/main/java/com/example/ticket/application
+
+  - id: payment-flow
+    name: 결제 처리 프로세스
+    type: process
+    summary: |
+      PaymentFacade가 오케스트레이션한다.
+      requestPayment()는 외부 PG(:8082)에 WebClient 동기 호출 → Payment(PENDING) 저장.
+      handleCallback()은 PG 콜백 수신 후:
+      - SUCCESS: Payment.success() + Reservation.confirm() + Seat.confirm() + Kafka 발행
+        + Active User 제거 + SSE 브로드캐스트
+      - FAILURE: Payment.fail() + Reservation.cancel() + Seat.release() + Redis 캐시 삭제
+        + Kafka 발행 + Active User 제거 + SSE 브로드캐스트
+    repo: ticket-lab-be
+    package: src/main/java/com/example/ticket/application
+
+  - id: sse-broadcast
+    name: SSE 실시간 알림
+    type: process
+    summary: |
+      SseEmitterRegistry가 연결된 클라이언트를 관리하고, Redis Pub/Sub(seat-status 채널)
+      메시지를 수신하여 전체 클라이언트에 좌석 상태 변경을 브로드캐스트한다.
+      GET /api/v1/sse/seats 엔드포인트로 구독.
+    repo: ticket-lab-be
+    package: src/main/java/com/example/ticket/infrastructure/sse
+
+  # ── data ─────────────────────────────────────────────────────
+  - id: seat
+    name: 좌석
+    type: data
+    summary: |
+      핵심 애그리거트. AVAILABLE → SELECTED → CONFIRMED 상태 전이.
+      select()/confirm()/release() 메서드로만 상태 변경(Rich Domain Model).
+      앱 기동 시 DataInitializer가 1~100번 좌석 100개를 자동 생성.
+      DB가 상태 원천; Redis 캐시(state:seat:{id}, TTL 5분)는 읽기 최적화 보조.
+    repo: ticket-lab-be
+    package: src/main/java/com/example/ticket/domain/seat
+
+  - id: reservation
+    name: 예약
+    type: data
+    summary: |
+      HELD → CONFIRMED 또는 HELD → CANCELLED 상태 전이.
+      hold()/confirm()/cancel() 메서드로만 상태 변경.
+      seat_reservation 프로세스에서 HELD 생성, payment_flow에서 최종 확정/취소.
+    repo: ticket-lab-be
+    package: src/main/java/com/example/ticket/domain/reservation
+
+  - id: payment
+    name: 결제
+    type: data
+    summary: |
+      PENDING → SUCCESS 또는 PENDING → FAILED 상태 전이.
+      success()/fail() 메서드로만 상태 변경.
+      transactionKey로 외부 PG 콜백과 매핑.
+    repo: ticket-lab-be
+    package: src/main/java/com/example/ticket/domain/payment
+
+  - id: user
+    name: 사용자
+    type: data
+    summary: |
+      email(unique) + BCrypt 패스워드. JWT(jjwt 0.12.6)로 인증.
+      상태 전이 없음. 대기열 진입/이탈은 별도 Redis 키로 관리.
+    repo: ticket-lab-be
+    package: src/main/java/com/example/ticket/domain/user
+
+  - id: reservation-event
+    name: 예약 이벤트
+    type: data
+    summary: |
+      Kafka 직렬화용 DTO. DB 엔티티 아님.
+      EventType: RESERVATION_SUCCESS / RESERVATION_FAILED / RESERVATION_CANCELLED.
+      Producer acks=all, key=seatId(순서 보장), Consumer 수동 커밋(At-least-once).
+    repo: ticket-lab-be
+    package: src/main/java/com/example/ticket/domain/event
+
+  # ── external ─────────────────────────────────────────────────
+  - id: pg-simulator
+    name: PG 시뮬레이터
+    type: external
+    summary: |
+      결제 게이트웨이 모의 서버(:8082). POST /api/v1/payments 호출 후
+      콜백으로 성공/실패를 통보. WebClient 동기 블로킹 호출.
+
+relations:
+  # 대기열 → 좌석 선점 접근 제어
+  - from: waiting-queue
+    to: seat-reservation
+    type: triggers
+    note: isAllowed() 통과한 Active User만 reserve() 진입 가능
+
+  # 좌석 선점 → 데이터
+  - from: seat-reservation
+    to: seat
+    type: produces
+    note: Seat SELECTED 상태 전이
+  - from: seat-reservation
+    to: reservation
+    type: produces
+    note: Reservation HELD 생성
+  - from: seat-reservation
+    to: redis
+    type: depends_on
+    note: 분산 락(lock:seat:{id}) + 상태 캐시(state:seat:{id}) + Pub/Sub(seat-status)
+  - from: seat-reservation
+    to: sse-broadcast
+    type: triggers
+    note: 좌석 선점 후 상태 변경 브로드캐스트
+
+  # 결제 → 데이터
+  - from: payment-flow
+    to: payment
+    type: produces
+  - from: payment-flow
+    to: reservation
+    type: produces
+    note: HELD → CONFIRMED 또는 CANCELLED
+  - from: payment-flow
+    to: seat
+    type: produces
+    note: SELECTED → CONFIRMED 또는 AVAILABLE(release)
+  - from: payment-flow
+    to: kafka
+    type: produces
+    note: reservation-events 토픽 (파티션 3, acks=all, key=seatId)
+  - from: payment-flow
+    to: pg-simulator
+    type: depends_on
+    note: WebClient 동기 호출(:8082). 성공/실패는 콜백으로 수신
+  - from: payment-flow
+    to: sse-broadcast
+    type: triggers
+    note: 결제 완료/실패 후 상태 변경 브로드캐스트
+
+  # SSE 브로드캐스트 인프라
+  - from: sse-broadcast
+    to: redis
+    type: depends_on
+    note: seat-status Pub/Sub 채널 구독
+
+  # 데이터 → 인프라
+  - from: seat
+    to: mysql
+    type: deployed_in
+  - from: reservation
+    to: mysql
+    type: deployed_in
+  - from: payment
+    to: mysql
+    type: deployed_in
+  - from: user
+    to: mysql
+    type: deployed_in
+  - from: reservation-event
+    to: kafka
+    type: deployed_in
+    note: reservation-events 토픽
+
+  # 대기열 인프라
+  - from: waiting-queue
+    to: redis
+    type: depends_on
+    note: |
+      ZSet(ticket:waiting:queue), 개별 TTL 키(ticket:active:users:{id}, 5분),
+      QueueScheduler 1초 주기로 최대 200명 Active 전환
